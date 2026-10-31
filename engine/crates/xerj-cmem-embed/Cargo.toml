@@ -1,0 +1,23 @@
+[package]
+name = "xerj-cmem-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "all-MiniLM-L6-v2 embedder that reproduces claude-mem's stored vectors (256-token cap, Chroma-compatible truncation)"
+
+[dependencies]
+serde_json.workspace = true
+# The `parity` binary only.
+anyhow.workspace = true
+thiserror.workspace = true
+# Same versions as xerj-ai's `neural` feature, so this can move beside it.
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"

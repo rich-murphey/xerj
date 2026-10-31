@@ -7501,6 +7501,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "xerj-cmem-embed"
+version = "1.0.0-rc.100"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "hf-hub",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers",
+]
+
+[[package]]
 name = "xerj-common"
 version = "1.0.0-rc.100"
 dependencies = [
