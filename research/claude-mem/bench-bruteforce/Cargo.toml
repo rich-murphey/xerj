@@ -1,0 +1,19 @@
+[package]
+name = "bench-bruteforce"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: not a member of engine/'s workspace.
+[workspace]
+
+[dependencies]
+half = "2.7"
+rayon = "1.12"
+roaring = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
