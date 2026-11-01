@@ -1,5 +1,8 @@
 # ColBERT encoder and MaxSim in Rust (candle)
 
+> 2026-11-01: candle has since been removed from xerj-cmem-embed; both
+> models run on ONNX Runtime. See § Candle removed, MiniLM on ort.
+
 Compiled 2026-11-01 on `dv` (AMD EPYC 7351P, 16 cores / 32 threads)
 against xerj `798b2a19`. This is a port of the answerai-colbert-small-v1
 reranker that claude-mem-search-eval measured
@@ -542,3 +545,82 @@ Single-query encode, 8-row docs file:
   (ii) it would be about 6.3–6.5k tokens/s.
 - **Runtime:** rc.15, landed in `6b965768`: +9–16% unpinned and +3%
   pinned, plus the memory-safety fixes in its notes.
+
+## Candle removed, MiniLM on ort (added 2026-11-01)
+
+Rich approved, 2026-11-01: one engine, ONNX Runtime, with parity fixtures
+as the cross-check
+([claude-mem-rs#7](https://github.com/rich-murphey/claude-mem-rs/issues/7)).
+Landed in `5bb12a59`.
+
+- **ColBERT:** the candle backend and the `ColbertEncoder` trait are gone;
+  `colbert::Colbert` is the ort encoder. The hub body's 384 → 96 head is
+  plain Rust over `linear.weight`, read with `safetensors`; a graph with a
+  `token_vectors` output (`colbert-eager-head-opt.onnx`) skips it.
+  `colbert check`: 20/20 on hub `onnx/model.onnx` (1 − 5.8e-12, 1.45e-5)
+  and on `colbert-eager-head-opt.onnx` (1 − 5.7e-12, 1.77e-5).
+- **MiniLM:** runs the file live claude-mem runs: `Xenova/all-MiniLM-L6-v2`
+  `onnx/model.onnx` at `751bff37` (sha256 `759c3cd2…c46e`, byte-identical
+  to the `@huggingface/transformers` 4.3.1 cache in both live containers),
+  with that revision's `tokenizer.json`. The stored model tag is
+  `Xenova/all-MiniLM-L6-v2/fp32/mean/l2/256` on all 312,114 rows. Mean
+  pooling and L2 norm in Rust, 256-token cap as before.
+- **Build:** `ort` and `xerj-ai` (for the shared environment) are no longer
+  optional, and `onnx-experimental` is gone from this crate. pyke ships
+  no musl library (ort-sys `dist.tsv`), so there is no musl build of the
+  crate, and none is needed: release.yml builds `-p xerj-server` only, and
+  nothing depends on this crate. `--workspace` builds now unify
+  `xerj-ai/onnx-experimental` on; `cargo check --workspace --all-targets`
+  is clean, and `xerj-server` alone has no `ort` in its tree.
+
+**MiniLM parity**, 500 live `observation_embeddings` rows (450 random, 50
+narratives over 1,600 chars; 51 at the 256 cap), and 50 queries (the 22
+search-vs-live queries plus 28 live titles):
+
+| Comparison | min cosine | below 0.9999 |
+|---|---|---|
+| ort vs stored vectors | 1 − 7.3e-13 | 0 / 500 |
+| ort vs candle (production build at `da26465`), rows | 1 − 9.4e-13 | 0 / 500 |
+| ort vs candle, queries | 1 − 7.0e-13 | 0 / 50 |
+| candle vs stored | 1 − 9.0e-13 | 0 / 500 |
+
+Top-10 over the 500 rows is identical, order included, for 50/50 queries
+in each pairing: ort query on stored vectors against candle query on
+stored vectors, and ort query on ort re-embedded rows against stored. The
+stored vectors stay; nothing needs re-embedding.
+
+**Timings.** `parity bench` over the 450 random rows (47.0 tokens mean),
+pinned with `taskset` to physical cores, intra-op spinning off as in
+xerj-ai. Each run started only with no `rustc`/`cc1`/`cargo build`/
+`target/release` process, 1-minute load under 4, and the dv-bench lock
+held exclusively; load at start was 3.68–3.97. Docs tokens/s is the best
+batch setting; query is p50 / p99 over 200 encodes of an 18-token query.
+
+| | docs tokens/s, 16 thr (0–15) | 8 thr (0–7) | query 16 thr | query 8 thr |
+|---|---|---|---|---|
+| candle (`da26465`) | 1,415 | 1,307 | 17.6 / 24.6 ms | 19.0 / 29.9 ms |
+| ort, hub `model.onnx` | 7,182 (5.1×) | 7,149 (5.5×) | 9.5 / 11.4 ms | 8.4 / 10.6 ms |
+| ort, fused (not wired) | 11,407 (8.1×) | 9,033 (6.9×) | 6.4 / 7.6 ms | 5.5 / 6.6 ms |
+
+"Fused" is the hub file through `onnxruntime.transformers.optimizer`
+(`model_type="bert"`, 12 heads, hidden 384, `opt_level=0`; onnxruntime
+1.31.1): Attention 6, EmbedLayerNormalization 1, SkipLayerNormalization
+12, BiasGelu 6, nothing left unfused. It passes parity against the stored
+vectors (min 1 − 1.07e-12, 0 / 500 below 0.9999) and is another 1.3–1.6×
+on docs and 1.5× on queries. It is not wired: production keeps the file
+claude-mem runs. Taking it means pinning the optimiser output by sha256,
+as for `colbert-eager-head-opt.onnx`. The file is outside the repo, at
+`~/.cache/xerj-minilm/minilm-opt.onnx` on dv (sha256 `bedfe603…8186`).
+
+Spinning, from an earlier sweep at load 7–17 (indicative only): it did
+not help single queries at 1 or 8 threads, and helped docs at 4 threads
+(68 → 104 passages/s). MiniLM keeps it off.
+
+**claude-mem-rs** (rev bump in `b02783e`, described in `1a5535d`):
+`cargo tree -i candle-core` is empty. The contract test gives 680/0.
+Search vs live on the 22 queries is the same table under candle and ort
+(top-1 15/22, overlap@10 85%, live top-3 in ours 66/66), and `/v1/search`
+top-10 is identical between the candle and ort builds on the same SQLite
+copy for 50/50 queries. One fix came out of it: ort's INFO tracing went
+to stdout and corrupted the `embed` subcommand's vectors, so the default
+log filter is now `info,ort=warn`.
