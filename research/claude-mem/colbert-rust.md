@@ -264,3 +264,118 @@ the live store's ~15M tokens at about 40 min on 15 threads. It must
 re-pass `colbert check`. The candle softmax fix is filed upstream
 (https://github.com/huggingface/candle/issues/4084) and helps any
 candle BERT user, but it does not close the gap for this one.
+
+## ORT backend (added 2026-11-01)
+
+`colbert::onnx::OrtColbert` (`src/colbert/onnx.rs`, commit `ebe3f8ab`),
+behind the crate's new `onnx-experimental` feature. It uses the same
+`ort = 2.0.0-rc.12` dependency line and features as xerj-ai, so it is
+GNU/Linux only, and candle stays the default and the musl path. Both
+backends implement `ColbertEncoder`, which owns tokenisation, markers,
+`[MASK]` padding, length-grouped batching, the skiplist and the head, so
+only BERT's forward pass differs. ORT runs the hub export at `934fa8bb` and
+returns `last_hidden_state`. The 384 → 96 `linear.weight` (read from
+`model.safetensors`) and the L2 norm are applied in Rust with the same
+candle code as the candle path. The `colbert` binary picks ORT when
+`COLBERT_ONNX` names the file.
+
+**ONNX files at `934fa8bb`:** `model.onnx` (fp32, 133 MB), `model_fp16`,
+`model_int8` (byte-identical to `model_quantized`, same LFS oid),
+`model_uint8`, `model_q4`, `model_q4f16` and `model_bnb4`. There are no
+O-level optimised exports; ORT optimises at load (Level3).
+
+### Parity (`colbert check`)
+
+| Backend | ids / masks / kept | worst token cosine | MaxSim max abs error | rankings |
+|---|---|---|---|---|
+| candle | identical | 1 − 6.6e-12 | 1.4e-5 | 20/20 |
+| ORT fp32 `model.onnx` | identical | 1 − 6.0e-12 (d18 row 11) | 1.4e-5 | 20/20 |
+| ORT int8 `model_int8.onnx` | identical | 0.9636 (q15 row 1); median 0.9981; 1,039 of 1,069 below 0.9999 | 0.384 | 0/20 |
+
+int8 fails parity, and is reported separately. The first place where its
+ranking departs from the fixture's is between place 0 and 7, median 3.
+Whether that costs rerank accuracy would need the eval's R@5 run, not this
+fixture.
+
+### Timings
+
+Same harness, rows and host, release builds. The host carried 4–9 load
+from other users' processes (emacs, bun) and was otherwise free; each
+measurement's load is in the run log. "Candle fixed" is the softmax
+`softmax_last_dim` patch (temporary `[patch]`, not committed) plus
+`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=4294967295:glibc.malloc.trim_threshold=4294967295`.
+Query is p50 / p95 over 200 single encodes of the fixture's queries;
+documents are the 200 memsearch-en rows (44,462 tokens). Thread count is
+`RAYON_NUM_THREADS` for candle and ORT intra-op threads for ORT.
+
+| | candle | candle fixed | ORT Rust fp32 | ORT Rust int8 | PyTorch (PyLate) |
+|---|---|---|---|---|---|
+| docs tokens/s, 8 threads | 384 | 572 | 4,176 | 4,761 | — |
+| docs tokens/s, 15 threads | 389–406 | 618 | **5,078** | 6,490 | ~3,100 (16 threads) |
+| query, 1 thread | 103 / 114 ms¹ | 82 / 98 ms | 37.0 / 37.9 ms | — | — |
+| query, 4 threads | — | 99 / 121 ms | 17.5 / 18.6 ms | — | — |
+| query, 8 threads | 48 / 72 ms | 47–84 / 75–102 ms² | **13.1 / 15.3 ms** | 13.2 / 13.5 ms | 25 / 28–34 ms |
+| query, 15 threads | 64–86 / 83–95 ms | 71 / 95 ms | 17.2 / 19.2 ms | 16.3 / 18.9 ms | — |
+| load avg (1 min) | 4–19 | 5–9 | 4–8 | 7–10 | 6–12 |
+
+¹ under `ck` index load (19). ² two back-to-back runs. Candle's query time
+swings by tens of ms run to run, whatever the allocator; ORT's does not.
+
+**ORT session options**, as built: `GraphOptimizationLevel::Level3`
+(all graph optimisations), `with_intra_threads(N)`, inter-op left at the
+default (sequential executor, no inter-op pool), CPU memory arena and
+memory pattern at ORT's defaults (on), and `with_intra_op_spinning`
+on by default and off with `COLBERT_ONNX_SPIN=0`. One session sits
+behind a mutex, as in xerj-ai.
+
+**Spinning** matters for single queries above a few threads, and helps
+documents too:
+
+| intra threads | query p50 / p95, spinning on | spinning off |
+|---|---|---|
+| 1 | 37.0 / 37.9 ms | 36.9 / 37.4 ms |
+| 4 | 17.5 / 18.6 ms | 17.7 / 23.4 ms |
+| 8 | 13.1 / 15.3 ms | 20.6 / 23.9 ms |
+| 15 | 17.2 / 19.2 ms | 23.8 / 27.7 ms |
+| 15, docs | 5,078 tokens/s | 4,416 tokens/s |
+
+xerj-ai's MiniLM backend turns spinning off. For a ColBERT query on a
+dedicated pool, leaving it on (the ORT default) saves 7 ms at 8 threads.
+The cost is threads burning CPU between runs. 8 intra-op threads is the
+query sweet spot here, as it was for PyTorch.
+
+**Against Python onnxruntime.** Rust ORT reaches 5,078 tokens/s against
+the 6,729 measured earlier through Python. Most of that gap is the runtime
+version: rc.12 links onnxruntime 1.24.2, and Python onnxruntime 1.24.2 on
+the same rows and batches gives 5,829 tokens/s, against 6,730 for 1.31.1
+(+15%). The remaining 13% is on the Rust side: copying
+`last_hidden_state` into a candle tensor, the head on candle's rayon pool
+beside ORT's spinning pool, and tokenisation. None of this was profiled.
+
+**Size.** `colbert` is 6.9 MB with candle only and 26.6 MB with
+`onnx-experimental` (+19.6 MB). `download-binaries` links onnxruntime
+1.24.2 statically: no `.so` is copied and `ldd` shows none. The build
+downloads the prebuilt library from pyke's CDN.
+
+### What this means for claude-mem-rs
+
+- **ORT fp32 is the encoder to wire.** It passes parity exactly, encodes
+  documents 12.5× faster than candle at 15 threads (8× faster than candle
+  with both fixes), and the query takes 13 ms at 8 threads, half
+  PyTorch's 25. The live store's ~15M tokens take about 50 min on 15
+  threads.
+- **Blocks or costs** before it can go in:
+  - GNU/Linux only. A musl build of claude-mem-rs gets candle at 400–600
+    tokens/s.
+  - The build needs network access to pyke's CDN, or `ORT_LIB_LOCATION`
+    with a vendored onnxruntime, for offline and reproducible builds.
+  - `ort` 2.0.0 is still a release candidate, and rc.12 pins onnxruntime
+    1.24.2, 15% slower than 1.31. Moving to a newer rc also moves
+    xerj-ai, which shares the dependency line.
+  - One run at a time per session (mutex). Concurrent query encodes need
+    a session pool at ~133 MB of weights each, or a queue.
+  - The ORT and rayon thread pools must be sized together so they don't
+    oversubscribe.
+- **int8** is 28% faster on documents (6,490 tokens/s) and no faster on
+  queries. It fails token parity, so using it needs its own rerank
+  accuracy run first.
