@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 pub const MAX_TOKENS: usize = 512;
@@ -57,6 +57,23 @@ impl MicrobatchConfig {
         }
         Ok(self)
     }
+}
+
+/// The process's ONNX Runtime environment, created on first use. `ort`
+/// 2.0.0-rc.15 allows one environment per process, ever, and has no public
+/// accessor for it, so every session in the process takes it from here,
+/// xerj-cmem-embed's ColBERT backend included.
+pub fn environment() -> Result<&'static ort::environment::Environment> {
+    static ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
+    let _guard = INIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(env) = ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init()
+        .build()
+        .map_err(|e| anyhow!("create ONNX Runtime environment: {e}"))?;
+    Ok(ENV.get_or_init(|| env))
 }
 
 pub struct OnnxEmbedder {
@@ -209,7 +226,7 @@ impl OnnxEmbedder {
             "fatal" => ort::logging::LogLevel::Fatal,
             _ => ort::logging::LogLevel::Warning,
         };
-        let session = Session::builder()
+        let session = Session::builder(environment()?)
             .map_err(|e| anyhow!("create ONNX Runtime session builder: {e}"))?
             .with_log_level(ort_log_level)
             .map_err(|e| anyhow!("configure ONNX Runtime log level: {e}"))?

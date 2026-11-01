@@ -73,6 +73,9 @@ pub enum Error {
     #[cfg(feature = "onnx-experimental")]
     #[error("onnx output: {0}")]
     OrtOutput(String),
+    #[cfg(feature = "onnx-experimental")]
+    #[error("onnx runtime environment: {0:#}")]
+    OrtEnvironment(anyhow::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

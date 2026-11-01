@@ -21,14 +21,16 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 half = "2"
 # EXPERIMENTAL GNU/Linux ONNX Runtime backend for ColBERT, as xerj-ai's: the
 # same version and features, off by default so candle stays the musl path.
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = [
+ort = { version = "2.0.0-rc.15", optional = true, default-features = false, features = [
     "std", "ndarray", "tracing", "download-binaries", "tls-rustls",
     "copy-dylibs", "api-24",
 ] }
+# For its process-wide ONNX Runtime environment, which ort allows only once.
+xerj-ai = { path = "../xerj-ai", optional = true, features = ["onnx-experimental"] }
 
 [features]
 default = []
-onnx-experimental = ["dep:ort"]
+onnx-experimental = ["dep:ort", "dep:xerj-ai"]
 
 [[bin]]
 name = "parity"

@@ -48,7 +48,8 @@ impl OrtColbert {
         // SAFETY: the weights file is not modified while mapped.
         let weights = unsafe { MmapedSafetensors::new(&files.weights)? };
         let head = Head::new(weights.load("linear.weight", &Device::Cpu)?)?;
-        let session = Session::builder()?
+        let env = xerj_ai::onnx::environment().map_err(Error::OrtEnvironment)?;
+        let session = Session::builder(env)?
             .with_optimization_level(GraphOptimizationLevel::All)
             .map_err(ort::Error::from)?
             .with_intra_threads(intra_threads.max(1))
