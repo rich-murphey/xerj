@@ -379,3 +379,147 @@ downloads the prebuilt library from pyke's CDN.
 - **int8** is 28% faster on documents (6,490 tokens/s) and no faster on
   queries. It fails token parity, so using it needs its own rerank
   accuracy run first.
+
+## T1/T2: ORT version, fused attention, NUMA layout (added 2026-11-01)
+
+The two tests Rich approved. Same host. `pgrep '[t]arget/release/engines'`
+found no other benchmark running before any run. Load is noted per row.
+At 15–16 threads most of the 1-minute load is the bench's own threads;
+the background was 4–5 (emacs, bun).
+
+### T2a: `ort` 2.0.0-rc.15
+
+rc.15 links onnxruntime **1.31.0** (`ort-sys` build script; rc.14 moved to
+1.31, per its release notes), against rc.12's 1.24.2. **It cannot land on
+its own.** `ort-sys` declares `links = "onnxruntime"`, so the workspace
+holds one version, and xerj-ai moves with xerj-cmem-embed. rc.15 changed
+`Session::builder()` to `Session::builder(&Environment)`, and allows one
+`Environment` per process, ever (`ort::init().build()` fails once one has
+existed). `cargo check -p xerj-ai --features onnx-experimental` then fails
+at `crates/xerj-ai/src/onnx.rs:212` (E0061). Per the order, xerj-ai was
+not patched. The rc.15 work (version lines, lockfile, and a process-wide
+`OnceLock` environment in `colbert/onnx.rs`) is measured below but is not
+committed. Landing it needs the one-line change to xerj-ai's
+`Session::builder` call, plus a shared environment there as well.
+
+Hub `onnx/model.onnx`, same session options as before (`Level3`): parity
+1 − 5.9e-12, 1.39e-5, 20/20. Docs at 15 threads: 5,534–5,901 tokens/s
+(rc.12: 5,078), so **+9–16%** from the runtime version alone. Query at 8
+threads: 13.4–14.1 ms p50 (rc.12: 13.1), unchanged within noise.
+
+### T2b: eager re-export, fused attention, head in the graph
+
+`research/claude-mem/colbert_export.py` (uv script):
+- **Versions:** torch 2.11.0 (+cu130 wheel, run on CPU), transformers
+  5.3.0, onnx 1.23.2, onnxruntime 1.31.1.
+- **Export:** `BertModel.from_pretrained(..., revision=934fa8bb,
+  attn_implementation="eager")`, TorchScript exporter, opset 17, dynamic
+  batch and sequence.
+- **Optimizer:** `onnxruntime.transformers.optimizer.optimize_model(model_type="bert", num_heads=12, hidden_size=384)`
+  (config: 12 heads, hidden 384).
+
+With `--head` the graph also carries `linear.weight` (from `model.safetensors`)
+and `F.normalize`, with output `token_vectors` [batch, seq, 96]. The models
+are stored outside the repo, in `~/.cache/xerj-colbert/` on dv:
+
+| File | sha256 | Ops after optimisation |
+|---|---|---|
+| `colbert-eager-opt.onnx` (body, Rust head) | `c8d83894a0b3993a23843e46f5a2b52ae1bdfc58d12ec9703f29fb545b70294a` | Attention 12, EmbedLayerNormalization 1, SkipLayerNormalization 24, BiasGelu 12, MatMul 36, Cast 3 |
+| `colbert-eager-head-opt.onnx` (head in graph) | `45a436b89aec98f5d364d7e4980bb958912a37593e20015de9cb840557b4d743` | the same + MatMul 1, ReduceL2, Clip, Div, Shape, Expand, 2 Constant |
+
+The hub export fused no Attention (0 of 12). The eager export fuses all
+12, plus the embedding layer norm, and leaves no other unfused ops.
+
+**Parity** (`colbert check`; the ranking test now lets documents the
+fixture scores exactly equal swap places, see below):
+
+| Model | `ort` | worst token cosine | max score error | rankings |
+|---|---|---|---|---|
+| hub `model.onnx` | rc.15 | 1 − 5.9e-12 | 1.39e-5 | 20/20 |
+| eager, Rust head | rc.15 | 1 − 5.8e-12 | 1.35e-5 | 20/20 |
+| eager, head in graph | rc.15 | 1 − 5.7e-12 | 1.77e-5 | 20/20 |
+| hub `model.onnx` | rc.12 | 1 − 6.0e-12 | 1.40e-5 | 20/20 |
+| eager, head in graph | rc.12 | 1 − 5.5e-12 | 1.40e-5 | 20/20 |
+| eager, Rust head | rc.12 | 1 − 5.8e-12 | 1.40e-5 | 20/20 (19/20 under the strict test) |
+| candle | — | 1 − 6.6e-12 | 1.40e-5 | 20/20 |
+
+The one strict-test miss is q4 d42/d45, which the fixture scores 29.76151
+both, an exact tie at its 1e-5 rounding. The fixture breaks ties by
+index, so a 1e-6 difference flips them. A strict test on exact ties is
+moot, and `colbert check` now compares the sequence of fixture scores in
+our order, so only exactly tied documents may swap.
+
+### T2c: version against fusion (200 rows, docs at 15 threads, query at 8)
+
+| Model | `ort` | level | docs tokens/s (load) | query p50 / p95 (load) |
+|---|---|---|---|---|
+| hub `model.onnx` | rc.12 | Level3 | 5,078 (7.4) | 13.1 / 15.3 ms (6.0) |
+| hub `model.onnx` | rc.15 | Level3 | 5,534–5,901 (4.4–7.5) | 13.4–14.1 / 15.3–15.5 ms (7–8) |
+| hub `model.onnx` | rc.15 | All | 5,787 (9.0) | 16.7 / 17.4 ms (8.0) |
+| eager, Rust head | rc.15 | Level3 | 6,419 (9.5) | 10.8 / 11.7 ms (9.2) |
+| eager, Rust head | rc.15 | All | 6,579 (8.8) | 10.2 / 11.4 ms (9.0) |
+| **eager, head in graph** | rc.15 | All | **7,079** (9.6) | **9.6 / 10.6 ms** (9.1) |
+
+- **Version:** +9–16% on docs.
+- **Fused attention:** +11–14% on docs and −24% on query latency.
+- **Head in the graph:** another +8% on docs and −6% on queries. It removes
+  the hidden-state copy and candle's second (rayon) thread pool.
+- **`All` against `Level3`** (`ORT_ENABLE_LAYOUT` in `ort`): within noise.
+- **Net,** against the rc.12 hub baseline: **+39% docs, −27% query.**
+
+### T1: sessions, threads and pinning
+
+Run with `colbert-eager-head-opt.onnx` on rc.15 at `All`, with intra-op
+spinning on, over all 955 memsearch-en rows (221,869 input tokens).
+Multi-session layouts are separate processes under `numactl
+--physcpubind=<that node's physical cores> --membind=<node>`, each given a
+round-robin share of the rows. Their aggregate is total tokens over the
+slowest process's wall time; the sum of per-process rates is in brackets.
+
+| Layout | docs tokens/s | load (start → end) |
+|---|---|---|
+| (i) 1 × 15 threads, unpinned | 7,210 | 7.1 → 11.5 |
+| (ii) 1 × 16, `taskset -c 0-15` (physical cores) | 8,604 (+19%) | 11.2 → 14.4 |
+| (iii) 4 × 4, one per NUMA node, node-local memory | 8,804 [9,235] (+22%) | 14.0 → 15.6 |
+| (iv) 2 × 8, nodes 0+1 and 2+3 | 8,946 [9,037] (+24%) | 14.3 → 16.2 |
+| (ii) on rc.12 (the committed state) | 8,347 | 5.3 → 10.5 |
+
+Single-query encode, 8-row docs file:
+
+| Layout | p50 / p95 / max | load |
+|---|---|---|
+| 1 × 4, node 0 cores 0–3, node-0 memory | 13.4 / 14.5 / 14.9 ms | 13.4 |
+| 1 × 8, unpinned | 10.4 / 11.6 / 44.8 ms | 11.6 |
+| 1 × 8, cores 0–7, nodes 0–1 memory | 10.7 / 10.95 / 11.7 ms | 9.6 |
+| 1 × 8, cores 0–7, rc.12 | 10.5 / 10.8 / 11.1 ms | 10.9 |
+
+**Reading:**
+- **Keeping threads on physical cores is most of the gain.** That means
+  no SMT siblings and no migration onto the cores the background load
+  uses.
+- **NUMA sharding adds only 2–4% over one pinned 16-thread session,** at
+  4× (or 2×) the sessions and weight copies. The 1.22× scaling from 8 to
+  15 threads seen earlier was mostly unpinned threads, not cross-die
+  traffic.
+- **Queries:** pinning cuts the tail (max 44.8 → 11.7 ms) rather than the
+  median. Four threads on one node cost 3 ms more than eight on two
+  nodes.
+
+### Recommended production configuration (dv-class host)
+
+- **Model:** `colbert-eager-head-opt.onnx`, regenerated with
+  `colbert_export.py` and checked by sha256, run with ORT at `All`,
+  intra-op spinning on. It passes the fixture 20/20.
+- **Bulk ingest:** one session, 16 intra-op threads, pinned to physical
+  cores 0–15. That gives 8.3k tokens/s on rc.12 and 8.6k on rc.15, so the
+  live store's ~16.6M input tokens (16.3M MiniLM tokens plus a marker per
+  part) take **about 32–33 min**. Use 2 × 8 NUMA sessions only if the
+  last 4% matters.
+- **Live queries:** one session, 8 threads pinned to cores 0–7 (nodes
+  0–1), 10.5 ms p50, 11 ms p95. If ingest and queries share the host,
+  give queries 4 threads on one node (13.4 / 14.5 ms) and ingest the
+  other 12 cores. That ingest rate was not measured; at three quarters of
+  (ii) it would be about 6.3–6.5k tokens/s.
+- **Runtime:** rc.15 is worth taking, +9–16% unpinned and +3% pinned, plus
+  the memory-safety fixes in its notes. It needs xerj-ai's
+  `Session::builder(&Environment)` change first.
