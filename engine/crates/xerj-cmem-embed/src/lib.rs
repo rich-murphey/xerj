@@ -67,6 +67,12 @@ pub enum Error {
     Tokenizer(#[from] tokenizers::Error),
     #[error("candle: {0}")]
     Candle(#[from] candle_core::Error),
+    #[cfg(feature = "onnx-experimental")]
+    #[error("onnx runtime: {0}")]
+    Ort(#[from] ort::Error),
+    #[cfg(feature = "onnx-experimental")]
+    #[error("onnx output: {0}")]
+    OrtOutput(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

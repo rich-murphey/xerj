@@ -7,6 +7,12 @@
 //!   colbert check <colbert-parity.jsonl>
 //!   colbert bench <colbert-parity.jsonl> <rows.jsonl>
 //!
+//! The backend is candle unless `COLBERT_ONNX` names an ONNX file in the hub
+//! repo (`onnx/model.onnx`, `onnx/model_int8.onnx`, …; needs the
+//! `onnx-experimental` feature). Threads: `RAYON_NUM_THREADS` for candle,
+//! and the same value for ONNX Runtime's intra-op pool;
+//! `COLBERT_ONNX_SPIN=0` stops its idle threads spinning.
+//!
 //! `check` fails unless ids, masks and kept positions match exactly, every
 //! fixture token vector has cosine ≥ 0.9999, and each query ranks the 50
 //! documents in the fixture's order. `bench` times single-query encodes over
@@ -17,7 +23,9 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::time::Instant;
-use xerj_cmem_embed::colbert::{from_f16, maxsim, to_f16, Colbert, DIM, QUERY_TOKENS};
+use xerj_cmem_embed::colbert::{
+    from_f16, maxsim, to_f16, Colbert, ColbertEncoder, DIM, QUERY_TOKENS,
+};
 use xerj_cmem_embed::Batching;
 
 const MIN_COSINE: f64 = 0.9999;
@@ -118,7 +126,7 @@ fn ranking(scores: &[f64]) -> Vec<usize> {
     order
 }
 
-fn check(model: &Colbert, fx: &Fixture) -> Result<()> {
+fn check(model: &dyn ColbertEncoder, fx: &Fixture) -> Result<()> {
     let mut failures = 0;
     let mut worst = (1.0f64, String::new());
     let mut cosines = Vec::new();
@@ -147,7 +155,7 @@ fn check(model: &Colbert, fx: &Fixture) -> Result<()> {
     };
     let mut qv = Vec::new();
     for t in &fx.queries {
-        let input = model.query_input(&t.text)?;
+        let input = model.tokens().query_input(&t.text)?;
         let out = model.encode_query(&t.text)?;
         let all: Vec<usize> = (0..QUERY_TOKENS).collect();
         compare(t, &input.ids, &input.mask, &all, &out);
@@ -156,8 +164,14 @@ fn check(model: &Colbert, fx: &Fixture) -> Result<()> {
     let texts: Vec<&str> = fx.docs.iter().map(|t| t.text.as_str()).collect();
     let dv = model.encode_documents(&texts, Batching::default())?;
     for (t, out) in fx.docs.iter().zip(&dv) {
-        let input = model.document_input(&t.text)?;
-        compare(t, &input.ids, &input.mask, &model.kept(&input), out);
+        let input = model.tokens().document_input(&t.text)?;
+        compare(
+            t,
+            &input.ids,
+            &input.mask,
+            &model.tokens().kept(&input),
+            out,
+        );
     }
     cosines.sort_by(f64::total_cmp);
     println!(
@@ -232,7 +246,7 @@ fn random_rows(rows: usize, seed: &mut u64) -> Vec<f32> {
     v
 }
 
-fn bench(model: &Colbert, fx: &Fixture, rows_path: &str) -> Result<()> {
+fn bench(model: &dyn ColbertEncoder, fx: &Fixture, rows_path: &str) -> Result<()> {
     println!(
         "threads={} load={}",
         std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into()),
@@ -272,7 +286,7 @@ fn bench(model: &Colbert, fx: &Fixture, rows_path: &str) -> Result<()> {
     let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
     let tokens_in: usize = texts
         .iter()
-        .map(|t| model.document_input(t).map(|i| i.ids.len()))
+        .map(|t| model.tokens().document_input(t).map(|i| i.ids.len()))
         .sum::<xerj_cmem_embed::Result<usize>>()?;
     model.encode_documents(&texts[..8], Batching::default())?;
     for max_rows in [64, 8] {
@@ -327,6 +341,29 @@ fn bench(model: &Colbert, fx: &Fixture, rows_path: &str) -> Result<()> {
     Ok(())
 }
 
+fn load() -> Result<Box<dyn ColbertEncoder>> {
+    let Ok(onnx_file) = std::env::var("COLBERT_ONNX") else {
+        println!("backend=candle");
+        return Ok(Box::new(Colbert::load(None)?));
+    };
+    #[cfg(feature = "onnx-experimental")]
+    {
+        let threads = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        let spinning = std::env::var("COLBERT_ONNX_SPIN").map_or(true, |v| v != "0");
+        println!(
+            "backend=onnxruntime file={onnx_file} intra_threads={threads} spinning={spinning}"
+        );
+        Ok(Box::new(xerj_cmem_embed::colbert::onnx::OrtColbert::load(
+            None, &onnx_file, threads, spinning,
+        )?))
+    }
+    #[cfg(not(feature = "onnx-experimental"))]
+    bail!("COLBERT_ONNX={onnx_file}: built without the onnx-experimental feature")
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let (Some(cmd), Some(path)) = (args.get(1), args.get(2)) else {
@@ -334,11 +371,11 @@ fn main() -> Result<()> {
     };
     let fx = read_fixture(path)?;
     let t = Instant::now();
-    let model = Colbert::load(None)?;
+    let model = load()?;
     eprintln!("model loaded in {:.2}s", t.elapsed().as_secs_f64());
     match (cmd.as_str(), args.get(3)) {
-        ("check", _) => check(&model, &fx),
-        ("bench", Some(rows)) => bench(&model, &fx, rows),
+        ("check", _) => check(model.as_ref(), &fx),
+        ("bench", Some(rows)) => bench(model.as_ref(), &fx, rows),
         _ => bail!("unknown command {cmd}"),
     }
 }

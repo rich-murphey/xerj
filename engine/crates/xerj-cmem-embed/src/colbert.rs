@@ -20,6 +20,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use tokenizers::{Tokenizer, TruncationParams};
 
+#[cfg(feature = "onnx-experimental")]
+pub mod onnx;
+
 pub const MODEL_ID: &str = "answerdotai/answerai-colbert-small-v1";
 
 /// The revision the eval's vectors and fixture were made with.
@@ -50,33 +53,19 @@ pub struct Input {
     pub mask: Vec<u32>,
 }
 
-pub struct Colbert {
-    bert: BertModel,
-    /// `linear.weight` transposed, `[384, DIM]`.
-    linear: Tensor,
+/// Tokenisation and output selection, shared by every backend.
+pub struct Tokens {
     query_tokenizer: Tokenizer,
     doc_tokenizer: Tokenizer,
     skiplist: HashSet<u32>,
-    device: Device,
 }
 
-impl Colbert {
-    /// Load from a directory holding `config.json`, `tokenizer.json` and
-    /// `model.safetensors`, or from the HF hub cache at [`REVISION`]
-    /// (downloading on a miss) when `local_dir` is `None`. Blocking.
-    pub fn load(local_dir: Option<&Path>) -> Result<Self> {
-        let repo = Repo::with_revision(MODEL_ID.into(), RepoType::Model, REVISION.into());
-        let files = ModelFiles::resolve(local_dir, repo)?;
-        let device = Device::Cpu;
-        let (bert, config, vb) = load_bert(&files, &device)?;
-        let linear = vb
-            .get((DIM, config.hidden_size), "linear.weight")?
-            .t()?
-            .contiguous()?;
+impl Tokens {
+    fn load(tokenizer_json: &Path) -> Result<Self> {
         // Text is cut one short of the target with [CLS] and [SEP] kept, so
         // a truncated input still ends in [SEP] once the marker is in.
         let tokenizer = |max_length: usize| -> Result<Tokenizer> {
-            let mut t = Tokenizer::from_file(&files.tokenizer)?;
+            let mut t = Tokenizer::from_file(tokenizer_json)?;
             t.with_padding(None);
             t.with_truncation(Some(TruncationParams {
                 max_length,
@@ -91,12 +80,9 @@ impl Colbert {
             .filter_map(|c| doc_tokenizer.token_to_id(&c.to_string()))
             .collect();
         Ok(Self {
-            bert,
-            linear,
             query_tokenizer,
             doc_tokenizer,
             skiplist,
-            device,
         })
     }
 
@@ -121,57 +107,24 @@ impl Colbert {
             .filter(|&i| !self.skiplist.contains(&input.ids[i]))
             .collect()
     }
+}
 
-    /// `QUERY_TOKENS × DIM` values, row-major. Blocking and CPU-bound.
-    pub fn encode_query(&self, text: &str) -> Result<Vec<f32>> {
-        let input = self.query_input(text)?;
-        let mut rows = self.forward(&[&input], QUERY_TOKENS)?;
-        Ok(rows.pop().unwrap_or_default())
+/// `linear` 384 → [`DIM`] without bias, then L2 norm per token.
+struct Head {
+    /// `linear.weight` transposed, `[384, DIM]`.
+    linear: Tensor,
+}
+
+impl Head {
+    fn new(weight: Tensor) -> Result<Self> {
+        Ok(Self {
+            linear: weight.t()?.contiguous()?,
+        })
     }
 
-    /// Per text, in input order, `kept × DIM` values, row-major. Blocking
-    /// and CPU-bound.
-    pub fn encode_documents(&self, texts: &[&str], batching: Batching) -> Result<Vec<Vec<f32>>> {
-        let inputs = texts
-            .iter()
-            .map(|t| self.document_input(t))
-            .collect::<Result<Vec<_>>>()?;
-        let lengths: Vec<usize> = inputs.iter().map(|i| i.ids.len()).collect();
-        let mut out = vec![Vec::new(); texts.len()];
-        for rows in group_by_padded_cost(&lengths, batching) {
-            let seq_len = rows.iter().map(|&i| lengths[i]).max().unwrap_or(0);
-            let batch: Vec<&Input> = rows.iter().map(|&i| &inputs[i]).collect();
-            let vectors = self.forward(&batch, seq_len)?;
-            for (i, all) in rows.into_iter().zip(vectors) {
-                out[i] = self
-                    .kept(&inputs[i])
-                    .into_iter()
-                    .flat_map(|p| &all[p * DIM..(p + 1) * DIM])
-                    .copied()
-                    .collect();
-            }
-        }
-        Ok(out)
-    }
-
-    /// Unit vectors at every position of each input's own length, padded in
-    /// the batch with [MASK] under attention mask 0.
-    fn forward(&self, inputs: &[&Input], seq_len: usize) -> Result<Vec<Vec<f32>>> {
-        let batch = inputs.len();
-        let mut ids = Vec::with_capacity(batch * seq_len);
-        let mut mask = Vec::with_capacity(batch * seq_len);
-        for input in inputs {
-            ids.extend_from_slice(&input.ids);
-            ids.resize(ids.len() + seq_len - input.ids.len(), MASK);
-            mask.extend_from_slice(&input.mask);
-            mask.resize(mask.len() + seq_len - input.mask.len(), 0);
-        }
-        let input_ids = Tensor::from_vec(ids, (batch, seq_len), &self.device)?;
-        let attention_mask = Tensor::from_vec(mask, (batch, seq_len), &self.device)?;
-        let token_type_ids = input_ids.zeros_like()?;
-        let hidden = self
-            .bert
-            .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+    /// Unit vectors at every position of each input's own length, from
+    /// BERT's `[batch, seq_len, 384]` last hidden state.
+    fn apply(&self, hidden: &Tensor, inputs: &[&Input]) -> Result<Vec<Vec<f32>>> {
         let projected = hidden.broadcast_matmul(&self.linear)?;
         let norm = projected.sqr()?.sum_keepdim(2)?.sqrt()?;
         let unit = projected.broadcast_div(&norm)?;
@@ -186,6 +139,109 @@ impl Colbert {
             })
             .collect())
     }
+}
+
+/// Ids and mask of a batch, row-major `[inputs, seq_len]`, padded with
+/// [MASK] under attention mask 0.
+fn pad(inputs: &[&Input], seq_len: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut ids = Vec::with_capacity(inputs.len() * seq_len);
+    let mut mask = Vec::with_capacity(inputs.len() * seq_len);
+    for input in inputs {
+        ids.extend_from_slice(&input.ids);
+        ids.resize(ids.len() + seq_len - input.ids.len(), MASK);
+        mask.extend_from_slice(&input.mask);
+        mask.resize(mask.len() + seq_len - input.mask.len(), 0);
+    }
+    (ids, mask)
+}
+
+/// A backend: BERT's forward pass and the head, over shared tokenisation.
+pub trait ColbertEncoder {
+    fn tokens(&self) -> &Tokens;
+
+    /// Unit vectors at every position of each input's own length.
+    fn forward(&self, inputs: &[&Input], seq_len: usize) -> Result<Vec<Vec<f32>>>;
+
+    /// `QUERY_TOKENS × DIM` values, row-major. Blocking and CPU-bound.
+    fn encode_query(&self, text: &str) -> Result<Vec<f32>> {
+        let input = self.tokens().query_input(text)?;
+        let mut rows = self.forward(&[&input], QUERY_TOKENS)?;
+        Ok(rows.pop().unwrap_or_default())
+    }
+
+    /// Per text, in input order, `kept × DIM` values, row-major. Blocking
+    /// and CPU-bound.
+    fn encode_documents(&self, texts: &[&str], batching: Batching) -> Result<Vec<Vec<f32>>> {
+        let tokens = self.tokens();
+        let inputs = texts
+            .iter()
+            .map(|t| tokens.document_input(t))
+            .collect::<Result<Vec<_>>>()?;
+        let lengths: Vec<usize> = inputs.iter().map(|i| i.ids.len()).collect();
+        let mut out = vec![Vec::new(); texts.len()];
+        for rows in group_by_padded_cost(&lengths, batching) {
+            let seq_len = rows.iter().map(|&i| lengths[i]).max().unwrap_or(0);
+            let batch: Vec<&Input> = rows.iter().map(|&i| &inputs[i]).collect();
+            let vectors = self.forward(&batch, seq_len)?;
+            for (i, all) in rows.into_iter().zip(vectors) {
+                out[i] = tokens
+                    .kept(&inputs[i])
+                    .into_iter()
+                    .flat_map(|p| &all[p * DIM..(p + 1) * DIM])
+                    .copied()
+                    .collect();
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The candle backend, the default and the one musl builds have.
+pub struct Colbert {
+    bert: BertModel,
+    head: Head,
+    tokens: Tokens,
+    device: Device,
+}
+
+impl Colbert {
+    /// Load from a directory holding `config.json`, `tokenizer.json` and
+    /// `model.safetensors`, or from the HF hub cache at [`REVISION`]
+    /// (downloading on a miss) when `local_dir` is `None`. Blocking.
+    pub fn load(local_dir: Option<&Path>) -> Result<Self> {
+        let files = ModelFiles::resolve(local_dir, repo())?;
+        let device = Device::Cpu;
+        let (bert, config, vb) = load_bert(&files, &device)?;
+        let head = Head::new(vb.get((DIM, config.hidden_size), "linear.weight")?)?;
+        Ok(Self {
+            bert,
+            head,
+            tokens: Tokens::load(&files.tokenizer)?,
+            device,
+        })
+    }
+}
+
+impl ColbertEncoder for Colbert {
+    fn tokens(&self) -> &Tokens {
+        &self.tokens
+    }
+
+    fn forward(&self, inputs: &[&Input], seq_len: usize) -> Result<Vec<Vec<f32>>> {
+        let (ids, mask) = pad(inputs, seq_len);
+        let shape = (inputs.len(), seq_len);
+        let input_ids = Tensor::from_vec(ids, shape, &self.device)?;
+        let attention_mask = Tensor::from_vec(mask, shape, &self.device)?;
+        let token_type_ids = input_ids.zeros_like()?;
+        let hidden = self
+            .bert
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+        self.head.apply(&hidden, inputs)
+    }
+}
+
+fn repo() -> Repo {
+    Repo::with_revision(MODEL_ID.into(), RepoType::Model, REVISION.into())
 }
 
 /// `[CLS] marker text… [SEP]`, the text cut so the whole is one longer than

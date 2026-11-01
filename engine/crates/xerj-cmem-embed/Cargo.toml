@@ -19,6 +19,16 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 # fp16 storage form of ColBERT token vectors; already in the tree under candle.
 half = "2"
+# EXPERIMENTAL GNU/Linux ONNX Runtime backend for ColBERT, as xerj-ai's: the
+# same version and features, off by default so candle stays the musl path.
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = [
+    "std", "ndarray", "tracing", "download-binaries", "tls-rustls",
+    "copy-dylibs", "api-24",
+] }
+
+[features]
+default = []
+onnx-experimental = ["dep:ort"]
 
 [[bin]]
 name = "parity"
