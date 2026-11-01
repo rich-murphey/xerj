@@ -7508,6 +7508,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "half",
  "hf-hub",
  "serde_json",
  "thiserror 2.0.18",

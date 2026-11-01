@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "all-MiniLM-L6-v2 embedder that reproduces claude-mem's stored vectors (256-token cap, Chroma-compatible truncation)"
+description = "all-MiniLM-L6-v2 embedder that reproduces claude-mem's stored vectors (256-token cap, Chroma-compatible truncation), and an answerai-colbert-small-v1 late-interaction encoder"
 
 [dependencies]
 serde_json.workspace = true
@@ -17,7 +17,13 @@ candle-nn = "0.9"
 candle-transformers = "0.9"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+# fp16 storage form of ColBERT token vectors; already in the tree under candle.
+half = "2"
 
 [[bin]]
 name = "parity"
 path = "src/bin/parity.rs"
+
+[[bin]]
+name = "colbert"
+path = "src/bin/colbert.rs"

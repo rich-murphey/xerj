@@ -14,9 +14,12 @@
 //! `sentence-transformers/all-MiniLM-L6-v2` safetensors); only the token cap
 //! differs (xerj-ai: 512).
 
+pub mod colbert;
+
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+use hf_hub::Repo;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokenizers::{Encoding, Tokenizer, TruncationParams};
@@ -187,6 +190,54 @@ fn clip_utf16(text: &str) -> &str {
     text
 }
 
+/// `config.json`, `tokenizer.json` and `model.safetensors` of a BERT model.
+pub(crate) struct ModelFiles {
+    pub config: PathBuf,
+    pub tokenizer: PathBuf,
+    pub weights: PathBuf,
+}
+
+impl ModelFiles {
+    /// From a directory holding the three files, or from the HF hub cache
+    /// (downloading on a miss) when `local_dir` is `None`. Blocking.
+    pub fn resolve(local_dir: Option<&Path>, repo: Repo) -> Result<Self> {
+        Ok(match local_dir {
+            Some(dir) => Self {
+                config: dir.join("config.json"),
+                tokenizer: dir.join("tokenizer.json"),
+                weights: dir.join("model.safetensors"),
+            },
+            None => {
+                let repo = hf_hub::api::sync::Api::new()?.repo(repo);
+                Self {
+                    config: repo.get("config.json")?,
+                    tokenizer: repo.get("tokenizer.json")?,
+                    weights: repo.get("model.safetensors")?,
+                }
+            }
+        })
+    }
+}
+
+/// The BERT body, its config, and the weights it was read from, for a head
+/// stored beside it. Weights under `bert.` load through `model_type`.
+pub(crate) fn load_bert(
+    files: &ModelFiles,
+    device: &Device,
+) -> Result<(BertModel, Config, VarBuilder<'static>)> {
+    let config_json = std::fs::read_to_string(&files.config).map_err(|source| Error::Io {
+        path: files.config.clone(),
+        source,
+    })?;
+    let config: Config = serde_json::from_str(&config_json)?;
+    // SAFETY: the weights file is not modified while mapped.
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&files.weights), DTYPE, device)?
+    };
+    let model = BertModel::load(vb.clone(), &config)?;
+    Ok((model, config, vb))
+}
+
 pub struct Embedder {
     model: BertModel,
     tokenizer: Tokenizer,
@@ -199,28 +250,11 @@ impl Embedder {
     /// `model.safetensors`, or from the HF hub cache (downloading on a miss)
     /// when `local_dir` is `None`. Blocking.
     pub fn load(local_dir: Option<&Path>) -> Result<Self> {
-        let (config_path, tokenizer_path, weights_path) = match local_dir {
-            Some(dir) => (
-                dir.join("config.json"),
-                dir.join("tokenizer.json"),
-                dir.join("model.safetensors"),
-            ),
-            None => {
-                let repo = hf_hub::api::sync::Api::new()?.model(DEFAULT_MODEL_ID.into());
-                (
-                    repo.get("config.json")?,
-                    repo.get("tokenizer.json")?,
-                    repo.get("model.safetensors")?,
-                )
-            }
-        };
-        let config_json = std::fs::read_to_string(&config_path).map_err(|source| Error::Io {
-            path: config_path.clone(),
-            source,
-        })?;
-        let config: Config = serde_json::from_str(&config_json)?;
+        let files = ModelFiles::resolve(local_dir, Repo::model(DEFAULT_MODEL_ID.into()))?;
+        let device = Device::Cpu;
+        let (model, config, _) = load_bert(&files, &device)?;
 
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+        let mut tokenizer = Tokenizer::from_file(&files.tokenizer)?;
         // The hub tokenizer.json pads to a fixed 128 and truncates at 128;
         // padding is done per batch here, and the cap is MAX_TOKENS.
         tokenizer.with_padding(None);
@@ -229,16 +263,6 @@ impl Embedder {
             ..Default::default()
         }))?;
 
-        let device = Device::Cpu;
-        // SAFETY: the weights file is not modified while mapped.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                std::slice::from_ref(&weights_path),
-                DTYPE,
-                &device,
-            )?
-        };
-        let model = BertModel::load(vb, &config)?;
         Ok(Self {
             model,
             tokenizer,
@@ -310,7 +334,7 @@ impl Embedder {
 
 /// xerj-ai `microbatch::group_by_padded_cost`: sort by length, cut a batch
 /// when it would exceed the row cap or the padded-token budget.
-fn group_by_padded_cost(lengths: &[usize], b: Batching) -> Vec<Vec<usize>> {
+pub(crate) fn group_by_padded_cost(lengths: &[usize], b: Batching) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..lengths.len()).collect();
     order.sort_by_key(|&i| lengths[i]);
     let mut batches = Vec::new();
