@@ -61,8 +61,7 @@ impl MicrobatchConfig {
 
 /// The process's ONNX Runtime environment, created on first use. `ort`
 /// 2.0.0-rc.15 allows one environment per process, ever, and has no public
-/// accessor for it, so every session in the process takes it from here,
-/// xerj-cmem-embed's ColBERT backend included.
+/// accessor for it, so every session in the process takes it from here.
 pub fn environment() -> Result<&'static ort::environment::Environment> {
     static ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());

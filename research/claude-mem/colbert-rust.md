@@ -2,6 +2,12 @@
 
 > 2026-11-01: candle has since been removed from xerj-cmem-embed; both
 > models run on ONNX Runtime. See § Candle removed, MiniLM on ort.
+>
+> 2026-11-01: the crate has moved out of this repo, with its history, to
+> [rich-murphey/claude-mem-rs `crates/cmem-embed`](https://github.com/rich-murphey/claude-mem-rs/tree/main/crates/cmem-embed)
+> (`1a23bb2`, [claude-mem-rs#12](https://github.com/rich-murphey/claude-mem-rs/issues/12)),
+> renamed `cmem-embed`; `colbert_export.py` moved to that repo's
+> `scripts/models/`. Paths below are as they were in this repo.
 
 Compiled 2026-11-01 on `dv` (AMD EPYC 7351P, 16 cores / 32 threads)
 against xerj `798b2a19`. This is a port of the answerai-colbert-small-v1
