@@ -390,17 +390,36 @@ the background was 4–5 (emacs, bun).
 ### T2a: `ort` 2.0.0-rc.15
 
 rc.15 links onnxruntime **1.31.0** (`ort-sys` build script; rc.14 moved to
-1.31, per its release notes), against rc.12's 1.24.2. **It cannot land on
-its own.** `ort-sys` declares `links = "onnxruntime"`, so the workspace
+1.31, per its release notes), against rc.12's 1.24.2. ~~**It cannot land on
+its own.**~~ Landed in `6b965768` (2026-11-01, Rich approved the xerj-ai
+change). `ort-sys` declares `links = "onnxruntime"`, so the workspace
 holds one version, and xerj-ai moves with xerj-cmem-embed. rc.15 changed
 `Session::builder()` to `Session::builder(&Environment)`, and allows one
 `Environment` per process, ever (`ort::init().build()` fails once one has
-existed). `cargo check -p xerj-ai --features onnx-experimental` then fails
-at `crates/xerj-ai/src/onnx.rs:212` (E0061). Per the order, xerj-ai was
-not patched. The rc.15 work (version lines, lockfile, and a process-wide
-`OnceLock` environment in `colbert/onnx.rs`) is measured below but is not
-committed. Landing it needs the one-line change to xerj-ai's
-`Session::builder` call, plus a shared environment there as well.
+existed). Its only process-global accessor is the private
+`Environment::current()`. The doc-hidden `ort::test_util::test_env()` is
+not an API to build on. So xerj-ai now owns the environment:
+`xerj_ai::onnx::environment()` creates it once, behind a mutex, and every
+session uses it. That covers the MiniLM pool, and the ColBERT backend
+through a new optional `xerj-ai` dependency under xerj-cmem-embed's
+`onnx-experimental` feature. MiniLM's session options are unchanged
+(spinning off, `Level3`, thread count).
+
+Verification at `6b965768`:
+- **Checks:** `cargo check --workspace --all-targets` is clean, and so are
+  xerj-ai, xerj-cmem-embed, xerj-engine and xerj-server with
+  `onnx-experimental`.
+- **xerj-ai's onnx tests:** 19/19, including the ignored
+  `independent_pool_sessions_are_bit_identical`, run against
+  all-MiniLM-L6-v2's `onnx/model.onnx` at `1110a243`. It builds three
+  sessions in one process on the shared environment.
+- **`colbert check`:** 20/20 on the hub model (1 − 5.9e-12, 1.39e-5) and on
+  the fused head-in-graph model (1 − 5.7e-12, 1.77e-5).
+- **Bench (load 4.7–11):** 1 × 16 pinned to cores 0–15 gives 8,298
+  tokens/s (T1: 8,604); the 1 × 8 pinned query is 10.5 / 11.15 ms
+  (T1: 10.7 / 10.95).
+- **Binary size:** the `colbert` binary with the feature is 31.2 MB
+  (rc.12: 26.6 MB).
 
 Hub `onnx/model.onnx`, same session options as before (`Level3`): parity
 1 − 5.9e-12, 1.39e-5, 20/20. Docs at 15 threads: 5,534–5,901 tokens/s
@@ -521,6 +540,5 @@ Single-query encode, 8-row docs file:
   give queries 4 threads on one node (13.4 / 14.5 ms) and ingest the
   other 12 cores. That ingest rate was not measured; at three quarters of
   (ii) it would be about 6.3–6.5k tokens/s.
-- **Runtime:** rc.15 is worth taking, +9–16% unpinned and +3% pinned, plus
-  the memory-safety fixes in its notes. It needs xerj-ai's
-  `Session::builder(&Environment)` change first.
+- **Runtime:** rc.15, landed in `6b965768`: +9–16% unpinned and +3%
+  pinned, plus the memory-safety fixes in its notes.
