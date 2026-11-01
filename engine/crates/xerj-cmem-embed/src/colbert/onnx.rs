@@ -1,14 +1,16 @@
 //! EXPERIMENTAL ONNX Runtime backend (`onnx-experimental`, GNU/Linux), as
 //! xerj-ai's: the hub's own export of the BERT body at [`super::REVISION`]
 //! (`onnx/model.onnx`, fp32, or a quantised sibling), with tokenisation and
-//! output selection shared with the candle backend. The export stops at
-//! `last_hidden_state` [batch, seq, 384]; the 384 → 96 head is applied here
-//! from `model.safetensors`.
+//! output selection shared with the candle backend. The hub export stops at
+//! `last_hidden_state` [batch, seq, 384], and the 384 → 96 head is applied
+//! here from `model.safetensors`. A re-export with the head folded in
+//! (`research/claude-mem/colbert_export.py`, output `token_vectors`
+//! [batch, seq, 96], already unit length) is used as-is.
 //!
 //! The safe `ort` API runs a session through `&mut`, so the session sits
 //! behind a mutex; throughput comes from batching, not concurrent runs.
 
-use super::{pad, repo, ColbertEncoder, Head, Input, Tokens};
+use super::{pad, repo, ColbertEncoder, Head, Input, Tokens, DIM};
 use crate::{Error, ModelFiles, Result};
 use candle_core::{safetensors::MmapedSafetensors, Device, Tensor};
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -26,10 +28,11 @@ pub struct OrtColbert {
 }
 
 impl OrtColbert {
-    /// `onnx_file` is a path inside the hub repo (e.g. [`FP32_FILE`]) or, with
-    /// `local_dir`, inside that directory, beside `tokenizer.json` and
-    /// `model.safetensors`. `intra_threads` sizes ONNX Runtime's intra-op
-    /// pool; `spinning` lets its idle threads spin. Blocking.
+    /// `onnx_file` is an absolute path, a path inside the hub repo (e.g.
+    /// [`FP32_FILE`]) or, with `local_dir`, inside that directory, beside
+    /// `tokenizer.json` and `model.safetensors`. `intra_threads` sizes ONNX
+    /// Runtime's intra-op pool; `spinning` lets its idle threads spin.
+    /// Blocking.
     pub fn load(
         local_dir: Option<&Path>,
         onnx_file: &str,
@@ -38,6 +41,7 @@ impl OrtColbert {
     ) -> Result<Self> {
         let files = ModelFiles::resolve(local_dir, repo())?;
         let onnx_path = match local_dir {
+            _ if Path::new(onnx_file).is_absolute() => onnx_file.into(),
             Some(dir) => dir.join(onnx_file),
             None => hf_hub::api::sync::Api::new()?.repo(repo()).get(onnx_file)?,
         };
@@ -45,7 +49,7 @@ impl OrtColbert {
         let weights = unsafe { MmapedSafetensors::new(&files.weights)? };
         let head = Head::new(weights.load("linear.weight", &Device::Cpu)?)?;
         let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .with_optimization_level(GraphOptimizationLevel::All)
             .map_err(ort::Error::from)?
             .with_intra_threads(intra_threads.max(1))
             .map_err(ort::Error::from)?
@@ -84,7 +88,8 @@ impl ColbertEncoder for OrtColbert {
         })?;
         let output = outputs
             .get("last_hidden_state")
-            .ok_or_else(|| Error::OrtOutput("no last_hidden_state".into()))?;
+            .or_else(|| outputs.get("token_vectors"))
+            .ok_or_else(|| Error::OrtOutput("no last_hidden_state or token_vectors".into()))?;
         let (dims, hidden) = output.try_extract_tensor::<f32>()?;
         let dims: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
         let [batch, len, width] = dims[..] else {
@@ -95,6 +100,13 @@ impl ColbertEncoder for OrtColbert {
                 "output shape {dims:?} for {} × {seq_len} input",
                 inputs.len()
             )));
+        }
+        if width == DIM {
+            return Ok(inputs
+                .iter()
+                .zip(hidden.chunks_exact(len * DIM))
+                .map(|(input, rows)| rows[..input.ids.len() * DIM].to_vec())
+                .collect());
         }
         let hidden = Tensor::from_slice(hidden, (batch, len, width), &Device::Cpu)?;
         self.head.apply(&hidden, inputs)

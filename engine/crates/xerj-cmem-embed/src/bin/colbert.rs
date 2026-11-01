@@ -15,7 +15,8 @@
 //!
 //! `check` fails unless ids, masks and kept positions match exactly, every
 //! fixture token vector has cosine ≥ 0.9999, and each query ranks the 50
-//! documents in the fixture's order. `bench` times single-query encodes over
+//! documents in the fixture's order (documents the fixture scores exactly
+//! equal may swap). `bench` times single-query encodes over
 //! the fixture's queries, document encodes over the `text` of each line of
 //! `rows.jsonl` (claude-mem-search-eval `src/export-rows.ts`), and MaxSim
 //! over 50 random candidates of 54 and of 1,000 tokens.
@@ -192,12 +193,19 @@ fn check(model: &dyn ColbertEncoder, fx: &Fixture) -> Result<()> {
         for (a, b) in ours.iter().zip(&fx.scores[qi]) {
             max_err = max_err.max((a - b).abs());
         }
+        // Same order of fixture scores: documents the fixture scores equal
+        // (at its 1e-5 rounding) may swap places, nothing else may.
         let (r_ours, r_ref) = (ranking(&ours), ranking(&fx.scores[qi]));
-        if r_ours != r_ref {
+        let fixture_score = |d: &usize| fx.scores[qi][*d];
+        if !r_ours
+            .iter()
+            .map(fixture_score)
+            .eq(r_ref.iter().map(fixture_score))
+        {
             let at = r_ours
                 .iter()
                 .zip(&r_ref)
-                .position(|(a, b)| a != b)
+                .position(|(a, b)| fixture_score(a) != fixture_score(b))
                 .unwrap_or(0);
             println!(
                 "RANK {}: differs from place {at}: ours d{} {:.5}, fixture d{} {:.5}",
