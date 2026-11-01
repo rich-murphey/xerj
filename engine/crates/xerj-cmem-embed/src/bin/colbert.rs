@@ -7,10 +7,10 @@
 //!   colbert check <colbert-parity.jsonl>
 //!   colbert bench <colbert-parity.jsonl> <rows.jsonl>
 //!
-//! The backend is candle unless `COLBERT_ONNX` names an ONNX file in the hub
-//! repo (`onnx/model.onnx`, `onnx/model_int8.onnx`, …; needs the
-//! `onnx-experimental` feature). Threads: `RAYON_NUM_THREADS` for candle,
-//! and the same value for ONNX Runtime's intra-op pool;
+//! `COLBERT_ONNX` names the ONNX file: a path in the hub repo
+//! (`onnx/model.onnx`, the default, `onnx/model_int8.onnx`, …) or an
+//! absolute path (`colbert-eager-head-opt.onnx`). `ORT_INTRA_THREADS` sizes
+//! ONNX Runtime's intra-op pool (default: available parallelism);
 //! `COLBERT_ONNX_SPIN=0` stops its idle threads spinning.
 //!
 //! `check` fails unless ids, masks and kept positions match exactly, every
@@ -24,9 +24,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::time::Instant;
-use xerj_cmem_embed::colbert::{
-    from_f16, maxsim, to_f16, Colbert, ColbertEncoder, DIM, QUERY_TOKENS,
-};
+use xerj_cmem_embed::colbert::{from_f16, maxsim, to_f16, Colbert, DIM, FP32_FILE, QUERY_TOKENS};
 use xerj_cmem_embed::Batching;
 
 const MIN_COSINE: f64 = 0.9999;
@@ -127,7 +125,7 @@ fn ranking(scores: &[f64]) -> Vec<usize> {
     order
 }
 
-fn check(model: &dyn ColbertEncoder, fx: &Fixture) -> Result<()> {
+fn check(model: &Colbert, fx: &Fixture) -> Result<()> {
     let mut failures = 0;
     let mut worst = (1.0f64, String::new());
     let mut cosines = Vec::new();
@@ -254,10 +252,10 @@ fn random_rows(rows: usize, seed: &mut u64) -> Vec<f32> {
     v
 }
 
-fn bench(model: &dyn ColbertEncoder, fx: &Fixture, rows_path: &str) -> Result<()> {
+fn bench(model: &Colbert, fx: &Fixture, rows_path: &str) -> Result<()> {
     println!(
         "threads={} load={}",
-        std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into()),
+        std::env::var("ORT_INTRA_THREADS").unwrap_or_else(|_| "default".into()),
         loadavg()
     );
     let queries: Vec<&str> = fx.queries.iter().map(|t| t.text.as_str()).collect();
@@ -349,27 +347,15 @@ fn bench(model: &dyn ColbertEncoder, fx: &Fixture, rows_path: &str) -> Result<()
     Ok(())
 }
 
-fn load() -> Result<Box<dyn ColbertEncoder>> {
-    let Ok(onnx_file) = std::env::var("COLBERT_ONNX") else {
-        println!("backend=candle");
-        return Ok(Box::new(Colbert::load(None)?));
-    };
-    #[cfg(feature = "onnx-experimental")]
-    {
-        let threads = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|t| t.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        let spinning = std::env::var("COLBERT_ONNX_SPIN").map_or(true, |v| v != "0");
-        println!(
-            "backend=onnxruntime file={onnx_file} intra_threads={threads} spinning={spinning}"
-        );
-        Ok(Box::new(xerj_cmem_embed::colbert::onnx::OrtColbert::load(
-            None, &onnx_file, threads, spinning,
-        )?))
-    }
-    #[cfg(not(feature = "onnx-experimental"))]
-    bail!("COLBERT_ONNX={onnx_file}: built without the onnx-experimental feature")
+fn load() -> Result<Colbert> {
+    let onnx_file = std::env::var("COLBERT_ONNX").unwrap_or_else(|_| FP32_FILE.into());
+    let threads = std::env::var("ORT_INTRA_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let spinning = std::env::var("COLBERT_ONNX_SPIN").map_or(true, |v| v != "0");
+    println!("backend=onnxruntime file={onnx_file} intra_threads={threads} spinning={spinning}");
+    Ok(Colbert::load(None, &onnx_file, threads, spinning)?)
 }
 
 fn main() -> Result<()> {
@@ -382,8 +368,8 @@ fn main() -> Result<()> {
     let model = load()?;
     eprintln!("model loaded in {:.2}s", t.elapsed().as_secs_f64());
     match (cmd.as_str(), args.get(3)) {
-        ("check", _) => check(model.as_ref(), &fx),
-        ("bench", Some(rows)) => bench(model.as_ref(), &fx, rows),
+        ("check", _) => check(&model, &fx),
+        ("bench", Some(rows)) => bench(&model, &fx, rows),
         _ => bail!("unknown command {cmd}"),
     }
 }

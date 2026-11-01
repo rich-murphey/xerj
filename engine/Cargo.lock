@@ -7505,12 +7505,10 @@ name = "xerj-cmem-embed"
 version = "1.0.0-rc.100"
 dependencies = [
  "anyhow",
- "candle-core",
- "candle-nn",
- "candle-transformers",
  "half",
  "hf-hub",
  "ort",
+ "safetensors",
  "serde_json",
  "thiserror 2.0.18",
  "tokenizers",

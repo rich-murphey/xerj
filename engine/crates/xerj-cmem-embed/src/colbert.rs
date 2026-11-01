@@ -10,23 +10,37 @@
 //! every one of the 32 rows enters MaxSim. A document is `[CLS] [D] text
 //! [SEP]`, at most [`DOC_MAX_TOKENS`] ids, with punctuation tokens attended
 //! to and then dropped from the output.
+//!
+//! BERT runs on ONNX Runtime: either the hub's own export at [`REVISION`]
+//! ([`FP32_FILE`], or a quantised sibling), which stops at
+//! `last_hidden_state` [batch, seq, 384] so the head is applied here from
+//! `model.safetensors`, or a re-export with the head folded in
+//! (`research/claude-mem/colbert_export.py`, output `token_vectors`
+//! [batch, seq, 96], already unit length), used as-is.
+//!
+//! The safe `ort` API runs a session through `&mut`, so the session sits
+//! behind a mutex; throughput comes from batching, not concurrent runs.
 
-use crate::{group_by_padded_cost, load_bert, Batching, ModelFiles, Result};
-use candle_core::{Device, Tensor};
-use candle_transformers::models::bert::BertModel;
+use crate::{bert_inputs, group_by_padded_cost, model_file, session, Batching, Error, Result};
 use half::f16;
 use hf_hub::{Repo, RepoType};
+use ort::session::Session;
+use safetensors::{Dtype, SafeTensors};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
 use tokenizers::{Tokenizer, TruncationParams};
-
-#[cfg(feature = "onnx-experimental")]
-pub mod onnx;
 
 pub const MODEL_ID: &str = "answerdotai/answerai-colbert-small-v1";
 
 /// The revision the eval's vectors and fixture were made with.
 pub const REVISION: &str = "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e";
+
+/// The hub's fp32 export, the one of its files that passes parity.
+pub const FP32_FILE: &str = "onnx/model.onnx";
+
+/// Width of BERT's hidden state.
+const HIDDEN: usize = 384;
 
 /// Values per token vector.
 pub const DIM: usize = 96;
@@ -53,7 +67,7 @@ pub struct Input {
     pub mask: Vec<u32>,
 }
 
-/// Tokenisation and output selection, shared by every backend.
+/// Tokenisation and output selection.
 pub struct Tokens {
     query_tokenizer: Tokenizer,
     doc_tokenizer: Tokenizer,
@@ -111,33 +125,51 @@ impl Tokens {
 
 /// `linear` 384 → [`DIM`] without bias, then L2 norm per token.
 struct Head {
-    /// `linear.weight` transposed, `[384, DIM]`.
-    linear: Tensor,
+    /// `linear.weight`, row-major `[DIM, 384]`.
+    weight: Vec<f32>,
 }
 
 impl Head {
-    fn new(weight: Tensor) -> Result<Self> {
-        Ok(Self {
-            linear: weight.t()?.contiguous()?,
-        })
+    fn load(safetensors_file: &Path) -> Result<Self> {
+        let bytes = std::fs::read(safetensors_file).map_err(|source| Error::Io {
+            path: safetensors_file.into(),
+            source,
+        })?;
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        let w = tensors.tensor("linear.weight")?;
+        if w.dtype() != Dtype::F32 || w.shape() != [DIM, HIDDEN] {
+            return Err(Error::Weights(format!(
+                "linear.weight is {:?} {:?}, not F32 [{DIM}, {HIDDEN}]",
+                w.dtype(),
+                w.shape()
+            )));
+        }
+        let weight = w
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        Ok(Self { weight })
     }
 
     /// Unit vectors at every position of each input's own length, from
     /// BERT's `[batch, seq_len, 384]` last hidden state.
-    fn apply(&self, hidden: &Tensor, inputs: &[&Input]) -> Result<Vec<Vec<f32>>> {
-        let projected = hidden.broadcast_matmul(&self.linear)?;
-        let norm = projected.sqr()?.sum_keepdim(2)?.sqrt()?;
-        let unit = projected.broadcast_div(&norm)?;
-        Ok(unit
-            .flatten_from(1)?
-            .to_vec2::<f32>()?
-            .into_iter()
-            .zip(inputs)
-            .map(|(mut v, input)| {
-                v.truncate(input.ids.len() * DIM);
-                v
+    fn apply(&self, hidden: &[f32], seq_len: usize, inputs: &[&Input]) -> Vec<Vec<f32>> {
+        inputs
+            .iter()
+            .zip(hidden.chunks_exact(seq_len * HIDDEN))
+            .map(|(input, rows)| {
+                let mut out = Vec::with_capacity(input.ids.len() * DIM);
+                for h in rows.chunks_exact(HIDDEN).take(input.ids.len()) {
+                    let start = out.len();
+                    out.extend(self.weight.chunks_exact(HIDDEN).map(|w| dot(w, h)));
+                    let v = &mut out[start..];
+                    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    v.iter_mut().for_each(|x| *x /= norm);
+                }
+                out
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -155,24 +187,65 @@ fn pad(inputs: &[&Input], seq_len: usize) -> (Vec<u32>, Vec<u32>) {
     (ids, mask)
 }
 
-/// A backend: BERT's forward pass and the head, over shared tokenisation.
-pub trait ColbertEncoder {
-    fn tokens(&self) -> &Tokens;
+pub struct Colbert {
+    session: Mutex<Session>,
+    /// `None` when the graph has the head folded in.
+    head: Option<Head>,
+    tokens: Tokens,
+}
 
-    /// Unit vectors at every position of each input's own length.
-    fn forward(&self, inputs: &[&Input], seq_len: usize) -> Result<Vec<Vec<f32>>>;
+impl Colbert {
+    /// `onnx_file` is an absolute path, a path inside the hub repo at
+    /// [`REVISION`] (e.g. [`FP32_FILE`]) or, with `local_dir`, inside that
+    /// directory, beside `tokenizer.json` (and `model.safetensors` when the
+    /// graph has no head). `intra_threads` sizes ONNX Runtime's intra-op
+    /// pool; `spinning` lets its idle threads spin. Blocking.
+    pub fn load(
+        local_dir: Option<&Path>,
+        onnx_file: &str,
+        intra_threads: usize,
+        spinning: bool,
+    ) -> Result<Self> {
+        let repo = repo();
+        let session = session(
+            &model_file(local_dir, &repo, onnx_file)?,
+            intra_threads.max(1),
+            spinning,
+        )?;
+        let has_head = session
+            .outputs()
+            .iter()
+            .any(|o| o.name() == "token_vectors");
+        let head = match has_head {
+            true => None,
+            false => Some(Head::load(&model_file(
+                local_dir,
+                &repo,
+                "model.safetensors",
+            )?)?),
+        };
+        Ok(Self {
+            session: Mutex::new(session),
+            head,
+            tokens: Tokens::load(&model_file(local_dir, &repo, "tokenizer.json")?)?,
+        })
+    }
+
+    pub fn tokens(&self) -> &Tokens {
+        &self.tokens
+    }
 
     /// `QUERY_TOKENS × DIM` values, row-major. Blocking and CPU-bound.
-    fn encode_query(&self, text: &str) -> Result<Vec<f32>> {
-        let input = self.tokens().query_input(text)?;
+    pub fn encode_query(&self, text: &str) -> Result<Vec<f32>> {
+        let input = self.tokens.query_input(text)?;
         let mut rows = self.forward(&[&input], QUERY_TOKENS)?;
         Ok(rows.pop().unwrap_or_default())
     }
 
     /// Per text, in input order, `kept × DIM` values, row-major. Blocking
     /// and CPU-bound.
-    fn encode_documents(&self, texts: &[&str], batching: Batching) -> Result<Vec<Vec<f32>>> {
-        let tokens = self.tokens();
+    pub fn encode_documents(&self, texts: &[&str], batching: Batching) -> Result<Vec<Vec<f32>>> {
+        let tokens = &self.tokens;
         let inputs = texts
             .iter()
             .map(|t| tokens.document_input(t))
@@ -194,49 +267,43 @@ pub trait ColbertEncoder {
         }
         Ok(out)
     }
-}
 
-/// The candle backend, the default and the one musl builds have.
-pub struct Colbert {
-    bert: BertModel,
-    head: Head,
-    tokens: Tokens,
-    device: Device,
-}
-
-impl Colbert {
-    /// Load from a directory holding `config.json`, `tokenizer.json` and
-    /// `model.safetensors`, or from the HF hub cache at [`REVISION`]
-    /// (downloading on a miss) when `local_dir` is `None`. Blocking.
-    pub fn load(local_dir: Option<&Path>) -> Result<Self> {
-        let files = ModelFiles::resolve(local_dir, repo())?;
-        let device = Device::Cpu;
-        let (bert, config, vb) = load_bert(&files, &device)?;
-        let head = Head::new(vb.get((DIM, config.hidden_size), "linear.weight")?)?;
-        Ok(Self {
-            bert,
-            head,
-            tokens: Tokens::load(&files.tokenizer)?,
-            device,
-        })
-    }
-}
-
-impl ColbertEncoder for Colbert {
-    fn tokens(&self) -> &Tokens {
-        &self.tokens
-    }
-
+    /// Unit vectors at every position of each input's own length.
     fn forward(&self, inputs: &[&Input], seq_len: usize) -> Result<Vec<Vec<f32>>> {
         let (ids, mask) = pad(inputs, seq_len);
-        let shape = (inputs.len(), seq_len);
-        let input_ids = Tensor::from_vec(ids, shape, &self.device)?;
-        let attention_mask = Tensor::from_vec(mask, shape, &self.device)?;
-        let token_type_ids = input_ids.zeros_like()?;
-        let hidden = self
-            .bert
-            .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
-        self.head.apply(&hidden, inputs)
+        let [input_ids, attention_mask, token_type_ids] =
+            bert_inputs(ids, mask, inputs.len(), seq_len)?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| Error::OrtOutput("session mutex poisoned".into()))?;
+        let outputs = session.run(ort::inputs! {
+            "input_ids" => input_ids,
+            "attention_mask" => attention_mask,
+            "token_type_ids" => token_type_ids,
+        })?;
+        let (name, width) = match self.head {
+            Some(_) => ("last_hidden_state", HIDDEN),
+            None => ("token_vectors", DIM),
+        };
+        let (shape, values) = outputs
+            .get(name)
+            .ok_or_else(|| Error::OrtOutput(format!("no {name}")))?
+            .try_extract_tensor::<f32>()?;
+        if shape[..] != [inputs.len() as i64, seq_len as i64, width as i64] {
+            return Err(Error::OrtOutput(format!(
+                "{name} shape {shape:?} for {} × {seq_len} input",
+                inputs.len()
+            )));
+        }
+        Ok(match &self.head {
+            Some(head) => head.apply(values, seq_len, inputs),
+            None => inputs
+                .iter()
+                .zip(values.chunks_exact(seq_len * DIM))
+                .map(|(input, rows)| rows[..input.ids.len() * DIM].to_vec())
+                .collect(),
+        })
     }
 }
 

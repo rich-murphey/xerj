@@ -6,11 +6,15 @@
 //!
 //!   parity check <rows.jsonl>   re-embed each row's text, cosine vs stored
 //!   parity bench <rows.jsonl>   passages/s by batch size, single-query latency
+//!
+//! `MINILM_ONNX` names another ONNX file (a path in the hub repo or an
+//! absolute path; default `onnx/model.onnx`); `ORT_INTRA_THREADS` sizes ONNX
+//! Runtime's intra-op pool (default: ONNX Runtime's choice).
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::time::Instant;
-use xerj_cmem_embed::{observation_parts, Batching, Embedder, MAX_TOKENS};
+use xerj_cmem_embed::{observation_parts, Batching, Embedder, MAX_TOKENS, ONNX_FILE};
 
 struct Row {
     id: String,
@@ -136,7 +140,7 @@ fn bench(emb: &Embedder, rows: &[Row]) -> Result<()> {
         "passages={} mean_tokens={:.1} threads={}",
         texts.len(),
         tokens as f64 / texts.len() as f64,
-        std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into())
+        std::env::var("ORT_INTRA_THREADS").unwrap_or_else(|_| "default".into())
     );
     emb.embed(&texts[..8], Batching::default())?;
     for max_rows in [64, 16, 4, 1] {
@@ -182,7 +186,12 @@ fn main() -> Result<()> {
     };
     let rows = read_rows(path)?;
     let t = Instant::now();
-    let emb = Embedder::load(None)?;
+    let onnx_file = std::env::var("MINILM_ONNX").unwrap_or_else(|_| ONNX_FILE.into());
+    let threads = std::env::var("ORT_INTRA_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
+    let emb = Embedder::load_with(None, &onnx_file, threads)?;
     eprintln!("model loaded in {:.2}s", t.elapsed().as_secs_f64());
     match cmd.as_str() {
         "check" => check(&emb, &rows),

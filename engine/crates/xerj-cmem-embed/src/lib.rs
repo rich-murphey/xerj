@@ -10,25 +10,39 @@
 //! special tokens, so a long text encodes as `[CLS]` + 254 word pieces +
 //! `[SEP]` with no repair step.
 //!
-//! The model is the same network as xerj-ai's `neural` backend (candle BERT,
-//! `sentence-transformers/all-MiniLM-L6-v2` safetensors); only the token cap
-//! differs (xerj-ai: 512).
+//! The network is the very file claude-mem runs: `onnx/model.onnx` of
+//! [`MODEL_ID`] at [`REVISION`] (sha256 [`ONNX_SHA256`]), with that
+//! revision's `tokenizer.json`, on ONNX Runtime (`ort`). Pooling and the norm
+//! are done here.
 
 pub mod colbert;
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-use hf_hub::Repo;
+use hf_hub::{Repo, RepoType};
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::value::Tensor;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
 /// The `model` column claude-mem writes for these vectors.
 pub const MODEL_TAG: &str = "Xenova/all-MiniLM-L6-v2/fp32/mean/l2/256";
 
-/// Hub repository holding the safetensors weights candle reads.
-pub const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+/// Hub repository of the ONNX export transformers.js (and so claude-mem) runs.
+pub const MODEL_ID: &str = "Xenova/all-MiniLM-L6-v2";
+
+/// The hub revision whose `onnx/model.onnx` is byte-identical to the file in
+/// the live claude-mem containers (`@huggingface/transformers` 4.3.1 cache).
+pub const REVISION: &str = "751bff37182d3f1213fa05d7196b954e230abad9";
+
+/// The fp32 export, inside the hub repo or a local model directory.
+pub const ONNX_FILE: &str = "onnx/model.onnx";
+
+/// sha256 of [`ONNX_FILE`] at [`REVISION`].
+pub const ONNX_SHA256: &str = "759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e";
+
+/// Width of the model's output and of every vector.
+pub const DIMS: usize = 384;
 
 /// Tokens per input, `[CLS]` and `[SEP]` included: the length the model was
 /// trained at and Chroma truncates to, not the tokenizer's 512.
@@ -61,19 +75,16 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("model config: {0}")]
-    Config(#[from] serde_json::Error),
     #[error("tokenizer: {0}")]
     Tokenizer(#[from] tokenizers::Error),
-    #[error("candle: {0}")]
-    Candle(#[from] candle_core::Error),
-    #[cfg(feature = "onnx-experimental")]
+    #[error("safetensors: {0}")]
+    Safetensors(#[from] safetensors::SafeTensorError),
+    #[error("weights: {0}")]
+    Weights(String),
     #[error("onnx runtime: {0}")]
     Ort(#[from] ort::Error),
-    #[cfg(feature = "onnx-experimental")]
     #[error("onnx output: {0}")]
     OrtOutput(String),
-    #[cfg(feature = "onnx-experimental")]
     #[error("onnx runtime environment: {0:#}")]
     OrtEnvironment(anyhow::Error),
 }
@@ -199,89 +210,96 @@ fn clip_utf16(text: &str) -> &str {
     text
 }
 
-/// `config.json`, `tokenizer.json` and `model.safetensors` of a BERT model.
-pub(crate) struct ModelFiles {
-    pub config: PathBuf,
-    pub tokenizer: PathBuf,
-    pub weights: PathBuf,
+/// A file of a hub model: `local_dir/name` when a directory is given, else
+/// from the HF hub cache at the pinned revision (downloading on a miss).
+/// Blocking.
+pub(crate) fn model_file(local_dir: Option<&Path>, repo: &Repo, name: &str) -> Result<PathBuf> {
+    Ok(match local_dir {
+        _ if Path::new(name).is_absolute() => name.into(),
+        Some(dir) => dir.join(name),
+        None => hf_hub::api::sync::Api::new()?
+            .repo(repo.clone())
+            .get(name)?,
+    })
 }
 
-impl ModelFiles {
-    /// From a directory holding the three files, or from the HF hub cache
-    /// (downloading on a miss) when `local_dir` is `None`. Blocking.
-    pub fn resolve(local_dir: Option<&Path>, repo: Repo) -> Result<Self> {
-        Ok(match local_dir {
-            Some(dir) => Self {
-                config: dir.join("config.json"),
-                tokenizer: dir.join("tokenizer.json"),
-                weights: dir.join("model.safetensors"),
-            },
-            None => {
-                let repo = hf_hub::api::sync::Api::new()?.repo(repo);
-                Self {
-                    config: repo.get("config.json")?,
-                    tokenizer: repo.get("tokenizer.json")?,
-                    weights: repo.get("model.safetensors")?,
-                }
-            }
-        })
-    }
+/// An ONNX Runtime session on the process's one environment
+/// (`xerj_ai::onnx::environment`), all graph optimisations on.
+/// `intra_threads` 0 leaves the pool size to ONNX Runtime.
+pub(crate) fn session(onnx: &Path, intra_threads: usize, spinning: bool) -> Result<Session> {
+    let env = xerj_ai::onnx::environment().map_err(Error::OrtEnvironment)?;
+    Ok(Session::builder(env)?
+        .with_optimization_level(GraphOptimizationLevel::All)
+        .map_err(ort::Error::from)?
+        .with_intra_threads(intra_threads)
+        .map_err(ort::Error::from)?
+        .with_intra_op_spinning(spinning)
+        .map_err(ort::Error::from)?
+        .commit_from_file(onnx)?)
 }
 
-/// The BERT body, its config, and the weights it was read from, for a head
-/// stored beside it. Weights under `bert.` load through `model_type`.
-pub(crate) fn load_bert(
-    files: &ModelFiles,
-    device: &Device,
-) -> Result<(BertModel, Config, VarBuilder<'static>)> {
-    let config_json = std::fs::read_to_string(&files.config).map_err(|source| Error::Io {
-        path: files.config.clone(),
-        source,
-    })?;
-    let config: Config = serde_json::from_str(&config_json)?;
-    // SAFETY: the weights file is not modified while mapped.
-    let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&files.weights), DTYPE, device)?
-    };
-    let model = BertModel::load(vb.clone(), &config)?;
-    Ok((model, config, vb))
+/// Ids and masks as the `int64` tensors a BERT export takes, plus all-zero
+/// `token_type_ids`, for one `[rows, seq_len]` batch.
+pub(crate) fn bert_inputs(
+    ids: Vec<u32>,
+    mask: Vec<u32>,
+    rows: usize,
+    seq_len: usize,
+) -> Result<[Tensor<i64>; 3]> {
+    let shape = [rows, seq_len];
+    let as_i64 = |v: Vec<u32>| v.into_iter().map(i64::from).collect::<Vec<_>>();
+    let types = vec![0i64; ids.len()];
+    Ok([
+        Tensor::from_array((shape, as_i64(ids)))?,
+        Tensor::from_array((shape, as_i64(mask)))?,
+        Tensor::from_array((shape, types))?,
+    ])
 }
 
+/// The safe `ort` API runs a session through `&mut`, so the session sits
+/// behind a mutex; throughput comes from batching, not concurrent runs.
 pub struct Embedder {
-    model: BertModel,
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
-    device: Device,
-    dims: usize,
 }
 
 impl Embedder {
-    /// Load from a directory holding `config.json`, `tokenizer.json` and
-    /// `model.safetensors`, or from the HF hub cache (downloading on a miss)
-    /// when `local_dir` is `None`. Blocking.
+    /// Load `tokenizer.json` and [`ONNX_FILE`] from `local_dir` (laid out as
+    /// the hub repo), or from the HF hub cache at [`REVISION`] (downloading on
+    /// a miss) when `local_dir` is `None`. ONNX Runtime sizes its own intra-op
+    /// pool. Blocking.
     pub fn load(local_dir: Option<&Path>) -> Result<Self> {
-        let files = ModelFiles::resolve(local_dir, Repo::model(DEFAULT_MODEL_ID.into()))?;
-        let device = Device::Cpu;
-        let (model, config, _) = load_bert(&files, &device)?;
+        Self::load_with(local_dir, ONNX_FILE, 0)
+    }
 
-        let mut tokenizer = Tokenizer::from_file(&files.tokenizer)?;
-        // The hub tokenizer.json pads to a fixed 128 and truncates at 128;
-        // padding is done per batch here, and the cap is MAX_TOKENS.
+    /// As [`Embedder::load`], with another ONNX file (a path in the repo or
+    /// directory, or an absolute path) and `intra_threads` intra-op threads
+    /// (0: ONNX Runtime's choice). Idle threads do not spin, as in xerj-ai's
+    /// MiniLM backend. Blocking.
+    pub fn load_with(
+        local_dir: Option<&Path>,
+        onnx_file: &str,
+        intra_threads: usize,
+    ) -> Result<Self> {
+        let repo = Repo::with_revision(MODEL_ID.into(), RepoType::Model, REVISION.into());
+        let onnx = model_file(local_dir, &repo, onnx_file)?;
+        let mut tokenizer = Tokenizer::from_file(model_file(local_dir, &repo, "tokenizer.json")?)?;
+        // The hub tokenizer.json truncates at 128 (and the
+        // sentence-transformers one also pads to 128); padding is done per
+        // batch here, and the cap is MAX_TOKENS.
         tokenizer.with_padding(None);
         tokenizer.with_truncation(Some(TruncationParams {
             max_length: MAX_TOKENS,
             ..Default::default()
         }))?;
-
         Ok(Self {
-            model,
+            session: Mutex::new(session(&onnx, intra_threads, false)?),
             tokenizer,
-            device,
-            dims: config.hidden_size,
         })
     }
 
     pub fn dims(&self) -> usize {
-        self.dims
+        DIMS
     }
 
     /// Token ids the model sees for `text`, special tokens included.
@@ -325,19 +343,45 @@ impl Embedder {
             mask.extend_from_slice(e.get_attention_mask());
             mask.resize(mask.len() + seq_len - e.get_attention_mask().len(), 0);
         }
-        let input_ids = Tensor::from_vec(ids, (batch, seq_len), &self.device)?;
-        let attention_mask = Tensor::from_vec(mask, (batch, seq_len), &self.device)?;
-        let token_type_ids = input_ids.zeros_like()?;
-        let hidden = self
-            .model
-            .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
-        let mask_f = attention_mask.to_dtype(DType::F32)?.unsqueeze(2)?;
-        let mean = hidden
-            .broadcast_mul(&mask_f)?
-            .sum(1)?
-            .broadcast_div(&mask_f.sum(1)?)?;
-        let norm = mean.sqr()?.sum_keepdim(1)?.sqrt()?;
-        Ok(mean.broadcast_div(&norm)?.to_vec2::<f32>()?)
+        let [input_ids, attention_mask, token_type_ids] =
+            bert_inputs(ids, mask.clone(), batch, seq_len)?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| Error::OrtOutput("session mutex poisoned".into()))?;
+        let outputs = session.run(ort::inputs! {
+            "input_ids" => input_ids,
+            "attention_mask" => attention_mask,
+            "token_type_ids" => token_type_ids,
+        })?;
+        let (shape, hidden) = outputs
+            .get("last_hidden_state")
+            .ok_or_else(|| Error::OrtOutput("no last_hidden_state".into()))?
+            .try_extract_tensor::<f32>()?;
+        if shape[..] != [batch as i64, seq_len as i64, DIMS as i64] {
+            return Err(Error::OrtOutput(format!(
+                "last_hidden_state shape {shape:?} for {batch} × {seq_len} input"
+            )));
+        }
+        // Attention-masked mean, then L2 norm, as transformers.js.
+        Ok(hidden
+            .chunks_exact(seq_len * DIMS)
+            .zip(mask.chunks_exact(seq_len))
+            .map(|(tokens, mask)| {
+                let mut sum = vec![0f32; DIMS];
+                let mut count = 0f32;
+                for (t, &m) in tokens.chunks_exact(DIMS).zip(mask) {
+                    if m != 0 {
+                        sum.iter_mut().zip(t).for_each(|(s, x)| *s += x);
+                        count += 1.0;
+                    }
+                }
+                sum.iter_mut().for_each(|s| *s /= count);
+                let norm = sum.iter().map(|x| x * x).sum::<f32>().sqrt();
+                sum.iter_mut().for_each(|s| *s /= norm);
+                sum
+            })
+            .collect())
     }
 }
 
