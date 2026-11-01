@@ -461,7 +461,8 @@ our order, so only exactly tied documents may swap.
 | **eager, head in graph** | rc.15 | All | **7,079** (9.6) | **9.6 / 10.6 ms** (9.1) |
 
 - **Version:** +9–16% on docs.
-- **Fused attention:** +11–14% on docs and −24% on query latency.
+- **Fused attention:** docs +16% (Level3) and +14% (All), against the hub
+  model in the same matrix run; query p50 −19% (Level3) and −39% (All).
 - **Head in the graph:** another +8% on docs and −6% on queries. It removes
   the hidden-state copy and candle's second (rayon) thread pool.
 - **`All` against `Level3`** (`ORT_ENABLE_LAYOUT` in `ort`): within noise.
