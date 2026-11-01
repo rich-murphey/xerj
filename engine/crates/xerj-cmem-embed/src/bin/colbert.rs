@@ -275,7 +275,7 @@ fn bench(model: &Colbert, fx: &Fixture, rows_path: &str) -> Result<()> {
         .map(|t| model.document_input(t).map(|i| i.ids.len()))
         .sum::<xerj_cmem_embed::Result<usize>>()?;
     model.encode_documents(&texts[..8], Batching::default())?;
-    for max_rows in [64, 32, 8] {
+    for max_rows in [64, 8] {
         let b = Batching {
             max_rows,
             ..Batching::default()
